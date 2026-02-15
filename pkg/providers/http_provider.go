@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/url"
 	"strings"
@@ -25,9 +26,12 @@ type HTTPProvider struct {
 	apiKey     string
 	apiBase    string
 	httpClient *http.Client
+
+	optionKeyMapping     map[string]string
+	optionValueOverrides map[string]any
 }
 
-func NewHTTPProvider(apiKey, apiBase, proxy string) *HTTPProvider {
+func NewHTTPProvider(apiKey, apiBase, proxy string, optionKeyMapping map[string]string, optionValueOverrides map[string]any) *HTTPProvider {
 	client := &http.Client{
 		Timeout: 120 * time.Second,
 	}
@@ -42,9 +46,11 @@ func NewHTTPProvider(apiKey, apiBase, proxy string) *HTTPProvider {
 	}
 
 	return &HTTPProvider{
-		apiKey:     apiKey,
-		apiBase:    strings.TrimRight(apiBase, "/"),
-		httpClient: client,
+		apiKey:               apiKey,
+		apiBase:              strings.TrimRight(apiBase, "/"),
+		httpClient:           client,
+		optionKeyMapping:     maps.Clone(optionKeyMapping),
+		optionValueOverrides: maps.Clone(optionValueOverrides),
 	}
 }
 
@@ -71,23 +77,17 @@ func (p *HTTPProvider) Chat(ctx context.Context, messages []Message, tools []Too
 		requestBody["tool_choice"] = "auto"
 	}
 
-	if maxTokens, ok := options["max_tokens"].(int); ok {
-		lowerModel := strings.ToLower(model)
-		if strings.Contains(lowerModel, "glm") || strings.Contains(lowerModel, "o1") {
-			requestBody["max_completion_tokens"] = maxTokens
-		} else {
-			requestBody["max_tokens"] = maxTokens
+	for optionKey, optionValue := range options {
+		requestKey := optionKey
+		if mappedKey, ok := p.optionKeyMapping[optionKey]; ok && mappedKey != "" {
+			requestKey = mappedKey
 		}
-	}
 
-	if temperature, ok := options["temperature"].(float64); ok {
-		lowerModel := strings.ToLower(model)
-		// Kimi k2 models only support temperature=1
-		if strings.Contains(lowerModel, "kimi") && strings.Contains(lowerModel, "k2") {
-			requestBody["temperature"] = 1.0
-		} else {
-			requestBody["temperature"] = temperature
+		if overrideValue, ok := p.optionValueOverrides[optionKey]; ok {
+			optionValue = overrideValue
 		}
+
+		requestBody[requestKey] = optionValue
 	}
 
 	jsonData, err := json.Marshal(requestBody)
@@ -224,6 +224,8 @@ func CreateProvider(cfg *config.Config) (LLMProvider, error) {
 	providerName := strings.ToLower(cfg.Agents.Defaults.Provider)
 
 	var apiKey, apiBase, proxy string
+	optionKeyMapping := map[string]string{}
+	optionValueOverrides := map[string]any{}
 
 	lowerModel := strings.ToLower(model)
 
@@ -429,5 +431,16 @@ func CreateProvider(cfg *config.Config) (LLMProvider, error) {
 		return nil, fmt.Errorf("no API base configured for provider (model: %s)", model)
 	}
 
-	return NewHTTPProvider(apiKey, apiBase, proxy), nil
+	// Option Key Mapping
+	for _, substring := range []string{"glm", "o1", "gpt-5"} {
+		if strings.Contains(lowerModel, substring) {
+			optionKeyMapping["max_tokens"] = "max_completion_tokens"
+		}
+	}
+	// Option Value Overrides
+	if strings.Contains(lowerModel, "kimi") && strings.Contains(lowerModel, "k2") {
+		optionValueOverrides["temperature"] = 1.0
+	}
+
+	return NewHTTPProvider(apiKey, apiBase, proxy, optionKeyMapping, optionValueOverrides), nil
 }
